@@ -30,10 +30,11 @@ def get_dac_encodec_clap(use_dac = True, use_encodec = True, use_clap = True):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     if use_dac:
-        import dac
-        dac_model_path = dac.utils.download(model_type="44khz")
-        dac_model = dac.DAC.load(dac_model_path)
-        dac_model.to(device)
+        pass
+        # import dac
+        # dac_model_path = dac.utils.download(model_type="44khz")
+        # dac_model = dac.DAC.load(dac_model_path)
+        # dac_model.to(device)
     else:
         dac_model = None
 
@@ -45,11 +46,12 @@ def get_dac_encodec_clap(use_dac = True, use_encodec = True, use_clap = True):
         encodec_model = None
 
     if use_clap:
-        import laion_clap
-        clap_model = laion_clap.CLAP_Module(enable_fusion=False, amodel= 'HTSAT-base', device=device) # need pip install transformers==4.30.0; if later version is installed, downgrade it to 4.30.0
-        clap_model.load_ckpt(
-            "./music_audioset_epoch_15_esc_90.14.pt"
-        ) # download the default pretrained checkpoint.
+        pass
+        # import laion_clap
+        # clap_model = laion_clap.CLAP_Module(enable_fusion=False, amodel= 'HTSAT-base', device=device) # need pip install transformers==4.30.0; if later version is installed, downgrade it to 4.30.0
+        # clap_model.load_ckpt(
+        #     "./music_audioset_epoch_15_esc_90.14.pt"
+        # ) # download the default pretrained checkpoint.
     else:
         clap_model = None
 

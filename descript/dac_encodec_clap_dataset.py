@@ -59,7 +59,7 @@ class DacEncodecClapDataset(Dataset):
         self.dac_model = dac_model
         self.encodec_model = encodec_model
         self.clap_model = clap_model
-
+        self.sample_rate_clap = 48000
         if encodec_model is not None:
             self.encodec_device = next(encodec_model.parameters()).device
             self.sample_rate_encodec = encodec_model.sample_rate
@@ -253,6 +253,9 @@ class DacEncodecClapDataset(Dataset):
     def get_rvq_latents_clap_from_wav(self, wav, sample_rate = None):
         if sample_rate is None:
             sample_rate = self.sample_rate
+        sample_rate = self.sample_rate_clap
+        if sample_rate == None:
+            sample_rate = 48000
         wav_clap = convert_audio(wav, sample_rate, self.sample_rate_clap, 1)
 
         dac_rvq, dac_latents, encodec_rvq, encodec_latents = self.get_rvq_latent_from_audio(wav, sample_rate)
@@ -413,13 +416,13 @@ class DacEncodecClapTextFeatDataset(DacEncodecClapDataset):
             self.audio_paths = []
             self.audio_names_from_json = list(self.text_feat_metadata.keys())
             for audio_path in self.raw_audio_paths:
-                audio_filename = os.path.basename(audio_path)
-                audio_name = os.path.splitext(audio_filename)[0]
-                audio_name = audio_name.split("_")[0]
-                if audio_name in self.audio_names_from_json:
-                    self.audio_paths.append(audio_path)
-                else:
-                    print(audio_name, "is not in the json metadata")
+                # audio_filename = os.path.basename(audio_path)
+                # audio_name = os.path.splitext(audio_filename)[0]
+                # audio_name = audio_name.split("_")[0]
+                # if audio_name in self.audio_names_from_json:
+                self.audio_paths.append(audio_path)
+                # else:
+                #     print(audio_name, "is not in the json metadata")
 
         # parse audio duration and get chunks to load
         if not self.no_audio_chunk:
