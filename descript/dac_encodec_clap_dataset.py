@@ -1,0 +1,629 @@
+import sys
+sys.path.append("..")
+
+from pathlib import Path
+import os
+import random
+import numpy as np
+import math
+
+import h5py
+import json
+
+from datetime import datetime
+
+import torch
+from torch.utils.data import Dataset
+import torchaudio
+
+from encodec.utils import convert_audio
+
+import librosa
+import audio_metadata
+from tinytag import TinyTag
+
+def int16_to_float32(x):
+    return (x / 32767.0).astype(np.float32)
+
+def float32_to_int16(x):
+    x = np.clip(x, a_min=-1., a_max=1.)
+    return (x * 32767.).astype(np.int16)
+
+SPECTROGRAM_NORMALIZATION_FACTOR = 100
+
+'''
+    Read audio files and convert them into dac tokens
+'''
+class DacEncodecClapDataset(Dataset):
+    def __init__(
+        self,
+        audio_folder,
+        dac_model,
+        encodec_model = None,
+        clap_model = None,
+        exts = ['mp3', 'wav'],
+        min_sec = 10,
+        start_silence_sec = 0,
+        skip_every_sec = None, # 15, if watermarks exist, have one chunk between each 2 watermarks
+        skip_sec = 1.596-0.259,
+        skip_start_sec = 15.259,
+        chunk_dur_sec = 60,
+        mel_freq_bins = 128,
+        mel_window_size = 4096,
+        mel_hop_size = 2048,
+        min_size = 300,  # in KB
+        percent_start_end = (None, None),
+    ):
+        super().__init__()
+        self.audio_folder = audio_folder
+        self.dac_model = dac_model
+        self.encodec_model = encodec_model
+        self.clap_model = clap_model
+        self.sample_rate_clap = 48000
+        if encodec_model is not None:
+            self.encodec_device = next(encodec_model.parameters()).device
+            self.sample_rate_encodec = encodec_model.sample_rate
+        if dac_model is not None:
+            self.sample_rate_dac = dac_model.sample_rate
+        if clap_model is not None:
+            self.clap_device = next(clap_model.parameters()).device
+            self.sample_rate_clap = 48000
+
+        self.no_audio_chunk = (encodec_model is None) and (dac_model is None) and (clap_model is None)
+
+        self.sample_rate = 48000
+        self.min_sec = min_sec
+
+        self.mel_freq_bins = mel_freq_bins
+        self.mel_window_size = mel_window_size
+        self.mel_hop_size = mel_hop_size
+        
+        self.start_silence_sec = start_silence_sec
+        self.skip_every_sec = skip_every_sec
+        self.skip_sec = skip_sec
+        self.skip_start_sec = skip_start_sec
+        self.chunk_dur_sec = chunk_dur_sec
+        if skip_every_sec is not None:
+            assert skip_every_sec - skip_sec >= chunk_dur_sec, "cannot get chunks that do not contain watermark"
+        
+        self.raw_audio_paths = [p for ext in exts for p in Path(f'{audio_folder}').glob(f'*.{ext}')]
+        self.raw_audio_paths_temp = []
+
+        if percent_start_end[0] is None or percent_start_end[1] is None:
+            i_raw_start = 0
+            i_raw_end = len(self.raw_audio_paths)
+        elif percent_start_end[0] >= 0 and percent_start_end[1] <= 100:
+            assert percent_start_end[0] < percent_start_end[1]
+            i_raw_start = int(percent_start_end[0] / 100 * len(self.raw_audio_paths))
+            i_raw_end = int(percent_start_end[1] / 100 * len(self.raw_audio_paths))
+        else:
+            i_raw_start = 0
+            i_raw_end = len(self.raw_audio_paths)
+
+        for i_raw, audio_path in enumerate(self.raw_audio_paths):
+            audio_filename = os.path.basename(audio_path)
+            audio_name = os.path.splitext(audio_filename)[0]
+            audio_name = audio_name.split("_")[0]
+            if i_raw >= i_raw_start and i_raw < i_raw_end:
+                if os.path.getsize(audio_path)/1000 > min_size:
+                    self.raw_audio_paths_temp.append(audio_path)
+                else:
+                    print(audio_name, "is too short")
+            # print(i_raw, audio_name, "is not in the percentage range, skipped")
+
+        self.raw_audio_paths = self.raw_audio_paths_temp[:]
+        self.audio_paths = self.raw_audio_paths[:]
+
+        self.use_dac = True
+        self.use_encodec = True
+        self.use_clap = True
+        if self.encodec_model is None:
+            self.use_encodec = False
+        if self.dac_model is None:
+            self.use_dac = False
+        if self.clap_model is None:
+            self.use_clap = False
+
+        # parse audio duration and get chunks to load
+        # self.get_chunks()
+
+    def get_chunks(self):
+        start_silence_sec = self.start_silence_sec
+        skip_every_sec = self.skip_every_sec
+        skip_sec = self.skip_sec
+        skip_start_sec = self.skip_start_sec
+        chunk_dur_sec = self.chunk_dur_sec
+        self.chunk_starts_pieces = [] # list of list
+        self.chunk_ends_pieces = [] # list of list
+        self.raw_durs = []
+        self.audio_paths_temp = []
+        for audio_path in self.audio_paths:
+            audio_filename = os.path.basename(audio_path)
+            audio_ext = os.path.splitext(audio_filename)[1]
+            try:
+                if "wav" in audio_ext:
+                    raw_dur = audio_metadata.load(audio_path).streaminfo['duration']
+                elif "mp3" in audio_ext:
+                    raw_dur = TinyTag.get(audio_path).duration
+                else:
+                    print(f"{audio_path} is not in supported audio type, discarded")
+                    continue
+            except Exception as e:
+                print(e)
+                print(f"An error encountered in chunking file {audio_path}, skipped")
+                continue
+
+            if raw_dur < self.min_sec:
+                print(f"{audio_path} is shorter than {self.min_sec} sec, discarded")
+                continue
+
+            self.audio_paths_temp.append(audio_path)
+            self.raw_durs.append(raw_dur)
+            chunk_starts = [start_silence_sec]
+            if skip_every_sec is not None:
+                chunk_starts_to_add = [s for s in np.arange(skip_start_sec+skip_sec, raw_dur-chunk_dur_sec, skip_every_sec)]
+            else:
+                chunk_starts_to_add = [s for s in np.arange(start_silence_sec+chunk_dur_sec, raw_dur-chunk_dur_sec, chunk_dur_sec)]
+
+            chunk_starts += chunk_starts_to_add
+            chunk_ends = [s+chunk_dur_sec for s in chunk_starts]
+
+            self.chunk_starts_pieces.append(chunk_starts[:])
+            self.chunk_ends_pieces.append(chunk_ends[:])
+
+        self.audio_paths = self.audio_paths_temp[:]
+
+        # assert (durations_sec > 0).all(), "there is an audio shorter than {} sec".format(start_silence_sec)
+        num_chunks_per_file = [len(chunks) for chunks in self.chunk_starts_pieces]
+        print("num audio paths:", len(self.raw_audio_paths))
+        print("num valid audio paths:", len(self.audio_paths))
+        self.num_chunks_cumsum = np.cumsum(num_chunks_per_file).astype(int)
+        self.num_chunks_cumsum = np.insert(self.num_chunks_cumsum, 0, 0)
+        self.num_chunks = self.num_chunks_cumsum[-1]
+    
+    def __len__(self):
+        return self.num_chunks
+
+    def find_file_id(self, index):
+        file_id_low = 0
+        file_id_high = len(self.num_chunks_cumsum)
+        if file_id_high == 1:
+            return 0
+        else:
+            while file_id_low < file_id_high:
+                file_id_mid = math.floor((file_id_low + file_id_high)/2)
+                
+                this_chunk_id = self.num_chunks_cumsum[file_id_mid]
+                next_chunk_id = self.num_chunks_cumsum[file_id_mid+1]
+                if this_chunk_id <= index and next_chunk_id > index:
+                    return file_id_mid
+                elif this_chunk_id > index:
+                    file_id_high = file_id_mid
+                elif next_chunk_id <= index:
+                    file_id_low = file_id_mid
+                else:
+                    assert 0, "invalid cumsum array"
+
+    def get_rvq_latent_from_audio(self, wav, sample_rate = None):
+        if sample_rate is None:
+            sample_rate = self.sample_rate
+        if self.use_dac:
+            wav_dac = convert_audio(
+                wav, sample_rate, self.sample_rate_dac, 1
+            ).unsqueeze(0).to(self.dac_model.device) # [1, 1, n_samples]
+        if self.use_encodec:
+            wav_encodec = convert_audio(
+                wav, sample_rate, self.sample_rate_encodec, self.encodec_model.channels
+            ).unsqueeze(0).to(self.encodec_device)
+
+        with torch.no_grad():
+            if self.use_dac:
+                _, codes, latents, _, _ = self.dac_model.encode(wav_dac) # [1, n_codebooks = 9, n_frames], [1, 8x9, n_frames]
+                print(codes[0].shape, latents[0].shape)
+            else:
+                codes, latents = [None], [None]
+            if self.use_encodec:
+                encodec_codes = self.encodec_model.encode(wav_encodec)[0]
+                encodec_latents = self.encodec_model.model.quantizer.decode(encodec_codes).reshape(-1, encodec_codes.shape[-1])
+                print(encodec_codes[0].shape, encodec_latents.shape)
+            else:
+                encodec_codes, encodec_latents = [None], None
+
+        return codes[0], latents[0], encodec_codes[0], encodec_latents
+        # [9, n_frames] (int), [72, n_frames] (float), [4, n_frames] (int), (4, 128, n_frames) (float)
+
+    def get_wav_through_file_id_and_relative_chunk_id(self, file_id, relative_index):
+        assert relative_index >= 0, "invalid find file id function"
+        audio_path = self.audio_paths[file_id]
+        start_sec = self.chunk_starts_pieces[file_id][relative_index]
+        sample_rate = torchaudio.info(audio_path).sample_rate
+        start_frame = int(start_sec * sample_rate)
+        dur_frame = int(self.chunk_dur_sec * sample_rate)
+        # wav = librosa.load(audio_path, sr=self.sample_rate, offset=start_sec, duration=self.chunk_dur_sec)[0]
+        wav, sr = torchaudio.load(audio_path, frame_offset = start_frame, num_frames = dur_frame)
+        return wav, sr
+
+    def get_wav_through_chunk_id(self, index):
+        file_id = self.find_file_id(index)
+        index_start = self.num_chunks_cumsum[file_id]
+        relative_index = index - index_start
+        return self.get_wav_through_file_id_and_relative_chunk_id(file_id, relative_index)
+
+    @torch.no_grad()
+    def get_rvq_latents_clap_from_wav(self, wav, sample_rate = None):
+        if sample_rate is None:
+            sample_rate = self.sample_rate
+        sample_rate = self.sample_rate_clap
+        if sample_rate == None:
+            sample_rate = 48000
+        wav_clap = convert_audio(wav, sample_rate, self.sample_rate_clap, 1)
+
+        dac_rvq, dac_latents, encodec_rvq, encodec_latents = self.get_rvq_latent_from_audio(wav, sample_rate)
+        if self.use_clap:
+            clap = self.clap_model.get_audio_embedding_from_data(x=wav_clap, use_tensor=True)
+        else:
+            clap = None
+
+        return dac_rvq, dac_latents, encodec_rvq, encodec_latents, clap
+
+    @torch.no_grad()
+    def __getitem__(self, index):
+        wav, sample_rate = self.get_wav_through_chunk_id(index)
+        return self.get_rvq_latents_clap_from_wav(wav, sample_rate)
+
+    def get_text_data_dict(self, audio_file_id):
+        pass
+
+    def get_spotify_meta_data_dict(self, audio_name):
+        pass
+
+    def get_text_feat_meta_data_dict(self, audio_name):
+        pass
+
+    def save_audio_text_to_h5_single(self, file_id, target_dir, skip_existing = False):
+        if not os.path.exists(target_dir):
+            os.makedirs(target_dir)
+            print("Target dir", target_dir, "is created!")
+
+        audio_path = self.audio_paths[file_id]
+        filename = Path(audio_path).name
+        basename = os.path.splitext(filename)[0]
+        out_h5_filename = f"{basename}.hdf5"
+        out_h5_path = os.path.join(target_dir, out_h5_filename)
+
+        # if skip_existing and os.path.exists(out_h5_path):
+        #     print(f"{out_h5_path} already exists. Skipped")
+        #     return
+
+        chunk_starts = self.chunk_starts_pieces[file_id]
+
+        for relative_index in range(len(chunk_starts)):
+            chunkname = f'{relative_index}'
+
+            print("=====================")
+            print(file_id, ": Parsing", basename, "chunk num", relative_index, "from", audio_path)
+
+            # save audio
+            print("------saving audio data------")
+            with h5py.File(out_h5_path, 'a') as f:
+                if (chunkname not in f or not skip_existing) and not self.no_audio_chunk:
+                    wav, sample_rate = self.get_wav_through_file_id_and_relative_chunk_id(file_id, relative_index)
+                    wav_spec = convert_audio(
+                        wav, sample_rate, self.sample_rate, 1
+                    ).squeeze().numpy()  # [n_samples]
+                    spectrogram = librosa.feature.melspectrogram(
+                        y=wav_spec, sr=self.sample_rate, n_fft=self.mel_window_size,
+                        hop_length=self.mel_hop_size, window='hann', center=True,
+                        pad_mode='constant', power=2.0, n_mels=self.mel_freq_bins
+                    )
+                    spectrogram_dB = librosa.power_to_db(spectrogram)
+                    spectrogram_dB = spectrogram_dB / SPECTROGRAM_NORMALIZATION_FACTOR
+                    dac_rvq, dac_latents, encodec_rvq, encodec_latents, audio_clap = self.get_rvq_latents_clap_from_wav(
+                        wav, sample_rate
+                    )
+                    print(f"Got chunk number {relative_index}")
+                    data_dict = {}
+                    if dac_rvq is not None:
+                        data_dict['dac_rvq'] = dac_rvq.cpu().numpy().astype(int)
+                        data_dict['dac_frame_len'] = dac_rvq.shape[-1]
+                        print("Got dac RVQ code with shape", data_dict['dac_rvq'].shape)
+                    if dac_latents is not None:
+                        data_dict['dac_latents'] = dac_latents.cpu().numpy().astype(np.float32)
+                        print("Got dac latent with shape", data_dict['dac_latents'].shape)
+                    if encodec_rvq is not None:
+                        data_dict['encodec_rvq'] = encodec_rvq.cpu().numpy().astype(int)
+                        data_dict['encodec_frame_len'] = encodec_rvq.shape[-1]
+                        print("Got encodec RVQ code with shape", data_dict['encodec_rvq'].shape)
+                    if encodec_latents is not None:
+                        data_dict['encodec_latents'] = encodec_latents.cpu().numpy().astype(np.float32)
+                        print("Got encodec latent with shape", data_dict['encodec_latents'].shape)
+                    if audio_clap is not None:
+                        data_dict['audio_clap'] = float32_to_int16(audio_clap.cpu().numpy())[0, :]
+                        print("Got audio clap with shape", data_dict['audio_clap'].shape)
+                    data_dict['spectrogram'] = float32_to_int16(spectrogram_dB)
+
+                    if chunkname not in f:
+                        grp = f.create_group(chunkname)
+                    else:
+                        grp = f[chunkname]
+
+                    for attr in data_dict:
+                        if attr not in grp:
+                            grp.create_dataset(attr, data=data_dict[attr])
+                            print("archived", attr, "with type", type(data_dict[attr]), "into hdf5 file")
+                        else:
+                            del grp[attr]
+                            grp.create_dataset(attr, data=data_dict[attr])
+                            print("updated", attr, "with type", type(data_dict[attr]), "into hdf5 file")
+                    print("\n")
+                else:
+                    print("chunk already exists")
+                    print("\n")
+
+            # save text feat for FMA
+            if hasattr(self, 'text_feat_metadata'):
+                print("------saving text feat meta data------")
+                with h5py.File(out_h5_path, 'a') as f:
+                    audio_name = basename.split("_")[0]
+                    data_dict = self.get_text_feat_meta_data_dict(audio_name)
+
+                    if "metadata" not in f:
+                        grp = f.create_group("metadata")
+                    else:
+                        grp = f["metadata"]
+
+                    for attr in data_dict:
+                        if attr not in grp:
+                            grp.create_dataset(attr, data=data_dict[attr])
+                            print("archived", attr, "with type", type(data_dict[attr]), "into hdf5 file")
+                        else:
+                            del grp[attr]
+                            grp.create_dataset(attr, data=data_dict[attr])
+                            print("updated", attr, "with type", type(data_dict[attr]), "into hdf5 file")
+                    print("\n")
+    def save_audio_text_to_h5_multiple(self, target_dir, skip_existing = False, file_id_sel = None):
+        if file_id_sel is None:
+            file_id_sel = range(len(self.audio_paths))
+        for file_id in file_id_sel:
+            try:
+                self.save_audio_text_to_h5_single(file_id, target_dir, skip_existing=skip_existing)
+            except Exception as ex:
+                trace = []
+                tb = ex.__traceback__
+                while tb is not None:
+                    trace.append({
+                        "filename": tb.tb_frame.f_code.co_filename,
+                        "name": tb.tb_frame.f_code.co_name,
+                        "lineno": tb.tb_lineno
+                    })
+                    tb = tb.tb_next
+                print(str({
+                    'type': type(ex).__name__,
+                    'message': str(ex),
+                    'trace': trace
+                }))
+
+class DacEncodecClapTextFeatDataset(DacEncodecClapDataset):
+    def __init__(self, *args, json_path = None, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.json_path = json_path
+        if json_path is not None:
+            with open(json_path) as f:
+                self.text_feat_metadata = json.load(f)
+
+            # parse audio according to csv
+            self.audio_paths = []
+            self.audio_names_from_json = list(self.text_feat_metadata.keys())
+            for audio_path in self.raw_audio_paths:
+                # audio_filename = os.path.basename(audio_path)
+                # audio_name = os.path.splitext(audio_filename)[0]
+                # audio_name = audio_name.split("_")[0]
+                # if audio_name in self.audio_names_from_json:
+                self.audio_paths.append(audio_path)
+                # else:
+                #     print(audio_name, "is not in the json metadata")
+
+        # parse audio duration and get chunks to load
+        if not self.no_audio_chunk:
+            self.get_chunks()
+
+    def get_text_feat_meta_data_dict(self, audio_name):
+        metadata_dict = self.text_feat_metadata[audio_name]
+
+        print(f"Got metadata of audio {audio_name}")
+
+        data_dict = {
+            'madmom_key': np.array(metadata_dict['madmom_key']),
+            'madmom_tempo': np.array(metadata_dict['madmom_tempo']),
+        }
+        if 'text' in metadata_dict:
+            print("Found text description")
+            data_dict['text'] = metadata_dict['text'].encode("ISO-8859-1", "ignore")
+            print("Got text", metadata_dict['text'])
+            text_clap = self.clap_model.get_text_embedding([metadata_dict['text'], ""])
+            print("Got CLAP text emb with dummy shape", text_clap.shape)
+            data_dict['text_clap'] = float32_to_int16(text_clap[0])
+        return data_dict
+
+'''
+    Read the h5 files in a folder
+    getting the dac_latents&rvq, encodec_latents&rvq, audio_clap, and meta data / text if applicable
+    Can be set to random mode, where the dataset_size should be specified
+'''
+class DacEncodecClapDatasetH5(Dataset):
+    def __init__(
+        self,
+        h5_dir,
+        dac_frame_len,
+        encodec_frame_len,
+        dataset_size=1000,
+        random_load=True,
+        random_text=True,
+        inpaint=False,
+    ):
+        super().__init__()
+        self.random_load = random_load
+
+        self.h5_dir = h5_dir
+        self.dac_frame_len = dac_frame_len
+        self.encodec_frame_len = encodec_frame_len
+
+        print("Reading dac h5 file metadata...")
+        self.h5_filenames = [filename for filename in os.listdir(h5_dir) if ".hdf5" in filename]
+        self.basenames = [os.path.splitext(filename)[0] for filename in self.h5_filenames]
+
+        print("Num files:", len(self.h5_filenames))
+        self.random_text = random_text
+
+        if not self.random_load:
+            self.num_chunks_per_file = []
+            for file_id in range(len(self.h5_filenames)):
+                file_name = self.h5_filenames[file_id]
+                file_path = os.path.join(self.h5_dir, file_name)
+                with h5py.File(file_path, "r") as f:
+                    num_chunks = len(f)
+                    if "text" in f:
+                        num_chunks = num_chunks - 1
+                    if "metadata" in f:
+                        num_chunks = num_chunks - 1
+                    self.num_chunks_per_file.append(num_chunks)
+
+            self.num_chunks_per_file = np.array(self.num_chunks_per_file)
+            self.num_chunks_per_file_cumsum = np.cumsum(self.num_chunks_per_file)
+            print("Num chunks:", self.num_chunks_per_file_cumsum[-1])
+        else:
+            self.dataset_size = dataset_size  # as loading is random, the size is dummy
+
+        self.inpaint = inpaint
+        self.total_runtime = 0
+        self.total_visits = 0
+
+    def __len__(self):
+        if not self.random_load:
+            return self.num_chunks_per_file_cumsum[-1]
+        else:
+            return self.dataset_size
+
+    def get_file_id_from_chunk_id(self, index):
+        return np.argmax(self.num_chunks_per_file_cumsum > index)
+
+    def get_objects(self, index):
+        if self.random_load:
+            file_id = random.randint(0, len(self.h5_filenames) - 1)
+        else:
+            file_id = self.get_file_id_from_chunk_id(index)
+
+        file_name = self.h5_filenames[file_id]
+        file_path = os.path.join(self.h5_dir, file_name)
+
+        with h5py.File(file_path, "r") as f:
+            num_chunks = len(f)
+            if "text" in f:
+                num_chunks = num_chunks - 1
+            if "metadata" in f:
+                num_chunks = num_chunks - 1
+
+            return_dict = {}
+
+            if "metadata" in f:
+                metadata_h5 = f["metadata"]
+                if "madmom_key" in metadata_h5:
+                    return_dict["madmom_key"] = np.array(metadata_h5['madmom_key'])
+                if "madmom_tempo" in metadata_h5:
+                    return_dict["madmom_tempo"] = np.array(metadata_h5['madmom_tempo'])
+
+                if "text" in metadata_h5:
+                    return_dict["text"] = metadata_h5["text"][()].decode("ISO-8859-1")
+                else:
+                    return_dict["text"] = ""
+                if "text_clap" in metadata_h5:
+                    return_dict["text_clap"] = int16_to_float32(np.array(metadata_h5["text_clap"]))
+                else:
+                    return_dict["text_clap"] = int16_to_float32(np.array(f["0"]['audio_clap']))
+
+            if self.random_load:
+                chunk_id = str(random.randint(0, num_chunks - 1))
+                # chunk_id = str(0) # debug for overfit test
+            else:
+                if file_id == 0:
+                    relative_chunk_id = int(index)
+                else:
+                    relative_chunk_id = int(index - self.num_chunks_per_file_cumsum[file_id - 1])
+                chunk_id = str(relative_chunk_id)
+
+            chunk_name = self.basenames[file_id] + f"_chunk_{chunk_id}"
+            return_dict["name"] = chunk_name
+
+            if 'dac_frame_len' in f[chunk_id]:
+                dac_frame_len_file = np.array(f[chunk_id]['dac_frame_len'])
+                if dac_frame_len_file < self.dac_frame_len:
+                    print("dac_frame_len_file, self.dac_frame_len:", dac_frame_len_file, self.dac_frame_len)
+                    if index < self.__len__():
+                        return self.get_objects(index + 1)
+                    else:
+                        return self.get_objects(index - 1)
+                    print(f"Chunk {chunk_name} is too short, loading another")
+                dac_frame_start = random.randint(0, dac_frame_len_file - self.dac_frame_len)
+                # frame_start = 0 # debug for overfit test
+                dac_latents = f[chunk_id]['dac_latents'][:, dac_frame_start:dac_frame_start + self.dac_frame_len]
+                dac_rvq = f[chunk_id]['dac_rvq'][:, dac_frame_start:dac_frame_start + self.dac_frame_len]
+                return_dict["dac_rvq"] = dac_rvq
+                return_dict["dac_latents"] = dac_latents
+
+            if 'encodec_frame_len' in f[chunk_id]:
+                encodec_frame_len_file = np.array(f[chunk_id]['encodec_frame_len'])
+                if encodec_frame_len_file < self.encodec_frame_len:
+                    if index < self.__len__():
+                        return self.get_objects(index + 1)
+                    else:
+                        return self.get_objects(index - 1)
+                    print(f"Chunk {chunk_name} is too short, loading another")
+                encodec_frame_start = random.randint(0, encodec_frame_len_file - self.encodec_frame_len)
+                encodec_latents = f[chunk_id]['encodec_latents'][:,encodec_frame_start:encodec_frame_start + self.encodec_frame_len]
+                encodec_rvq = f[chunk_id]['encodec_rvq'][:, encodec_frame_start:encodec_frame_start + self.encodec_frame_len]
+                return_dict["encodec_rvq"] = encodec_rvq
+                return_dict["encodec_latents"] = encodec_latents
+
+            if 'audio_clap' in f[chunk_id]:
+                audio_clap = int16_to_float32(np.array(f[chunk_id]['audio_clap']))
+                return_dict["audio_clap"] = audio_clap
+
+            if 'clap' in f[chunk_id]:
+                clap = int16_to_float32(np.array(f[chunk_id]['clap']))
+                return_dict["clap"] = clap
+
+            # if "spectrogram" in f[chunk_id]:
+            #     return_dict["spectrogram"] = int16_to_float32(np.array(f[chunk_id]['spectrogram']))
+
+            if "text" in f:
+                text_clap = int16_to_float32(np.array(f["text"]['clap']))
+                text = [str_bytes.decode("ISO-8859-1") for str_bytes in np.array(f["text"]['texts'])]
+
+                if self.random_text:
+                    text_id = random.randint(0, text_clap.shape[0] - 1)
+                return_dict["text_clap"] = text_clap[text_id]
+                return_dict["text"] = text[text_id]
+
+            if self.inpaint:
+                dac_mask = np.ones_like(dac_latents)
+                mask_start = self.dac_frame_len // 4
+                mask_end = (3*self.dac_frame_len) // 4
+                dac_mask[:, mask_start:mask_end] *= 0
+                return_dict["dac_inpaint_mask"] = dac_mask.astype(bool)
+
+                encodec_mask = np.ones_like(dac_latents)
+                mask_start = self.encodec_frame_len // 4
+                mask_end = (3*self.encodec_frame_len) // 4
+                encodec_mask[:, mask_start:mask_end] *= 0
+                return_dict["encodec_inpaint_mask"] = encodec_mask.astype(bool)
+
+        return return_dict
+
+    def __getitem__(self, index):
+        start = datetime.now()
+        return_dict = self.get_objects(index)
+        dur = datetime.now() - start
+        self.total_visits += 1
+        self.total_runtime += dur.total_seconds()
+        return return_dict
