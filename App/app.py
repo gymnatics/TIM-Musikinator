@@ -1,11 +1,49 @@
 import streamlit as st
 import numpy as np
-from transformers import pipeline
+from transformers import pipeline, AutoTokenizer,TFAutoModel
+import joblib
+
 
 classifier = pipeline("text-classification",model='bhadresh-savani/distilbert-base-uncased-emotion', return_all_scores=True)
 
+# NUM_CLASSES = 5
+# tf_model = (TFAutoModelForSequenceClassification.from_pretrained(model_ckpt, num_labels=NUM_CLASSES))
+# set tokenizer
+model_ckpt = "distilbert-base-uncased"
+tokenizer = AutoTokenizer.from_pretrained(model_ckpt)
+tf_model = TFAutoModel.from_pretrained(model_ckpt)
+
+def tokenize(batch):
+    encoded_dict =  tokenizer(batch, padding="max_length", truncation=True, max_length = 128)
+    input_ids = encoded_dict["input_ids"]
+    attention_mask = encoded_dict["attention_mask"]
+    return input_ids, attention_mask
+def extract_hidden_states(batch):
+    # First convert text to tokens
+    inputs = tokenizer(batch["text"], padding="max_length",
+                       truncation=True, return_tensors='tf', max_length = 128)
+    # Extract last hidden states
+    outputs = tf_model(inputs)
+     # Return vector for [CLS] token
+    return {"hidden_state": outputs.last_hidden_state[:,0].numpy()}
+
+# Load the saved sklearn model
+model_path_sklearn = "text_classification_model.pkl"
+lr_model = joblib.load(model_path_sklearn)
+def predict(input):
+    X_predict = np.array(input["hidden_state"])
+    predictions = lr_model.predict(X_predict)
+    
+    return predictions
+
+def detect_sentiment_custom(sentence):
+    extracted_features = extract_hidden_states({"text": sentence})
+    predictions = predict(extracted_features)[0]
+    labels = ['Sadness', 'Love', 'Joy', 'Anger', 'Fear']
+    return labels[predictions]
+
 def string_concat(string):
-    return ("This will be your caption: " + detect_sentiment(string))
+    return ("This will be your caption: " + detect_sentiment_custom(string))
 
 def detect_sentiment(sentence):
     labels_to_remove = ['disgust', 'surprise', 'neutral']
@@ -31,7 +69,8 @@ with col1:
                                 placeholder = "Write your caption here")
         st.write("Press **Enter** to confirm your caption")
         if caption:
-            st.write("Detected Sentiment: " + detect_sentiment(caption))
+            # st.write("Detected Sentiment: " + detect_sentiment(caption))
+            st.write("Detected Sentiment: " + detect_sentiment_custom(caption))
 
 with col2:
     with st.container():
