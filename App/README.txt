@@ -11,6 +11,7 @@ pip install numpy
 pip install protobuf-3.20.0
 
 Running the app:
+1. in your terminal run the command "pip install streamlit"
 1. Open the file directory in your terminal
 2. run the command "streamlit run app.py"
 3. Your local browser should open, please do wait for the webpage to finish loading as it may take a while.
