@@ -4,6 +4,12 @@ To allow users to create more meaningful content, our project aims to recommend 
 uses text-to-sentiment models to predict the emotion of the user's captions before recommending audio with matching emotions predicted
 by a music-to-emotion Machine learning model.
 
+Requirements:
+
+pip install streamlit
+pip install numpy
+pip install protobuf-3.20.0
+
 Running the app:
 1. Open the file directory in your terminal
 2. run the command "streamlit run app.py"
