@@ -11,6 +11,7 @@ pip install numpy
 pip install protobuf-3.20.0
 pip install tensorflow
 pip install tf-keras
+pip install joblib==1.3.2
 
 Running the app:
 1. in your terminal run the command "pip install streamlit"
