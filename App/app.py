@@ -6,6 +6,14 @@ import joblib
 
 classifier = pipeline("text-classification",model='bhadresh-savani/distilbert-base-uncased-emotion', return_all_scores=True)
 
+my_dict = {
+    'Sadness': [['Bad Day', 'Micahel Powter' , 'https://www.youtube.com/watch?v=gH476CxJxfg'], ['song2', 'Author 2' , 'https://www.youtube.com/watch?v=gH476CxJxfg']],
+    'Joy': [['Happy', 'Pharell Williams' , 'https://www.youtube.com/watch?v=ZbZSe6N_BXs'], ['song4', 'Author 4' , 'https://www.youtube.com/watch?v=ZbZSe6N_BXs']],
+    'Love': [['Just the way you are', 'Bruno Mars' , 'https://www.youtube.com/watch?v=u7XjPmN-tHw'], ['song6', 'Author 6' , 'https://www.youtube.com/watch?v=u7XjPmN-tHw']],
+    'Anger': [['Highway to hell', 'AC/DC' , 'https://www.youtube.com/watch?v=LMuDrj5BpM0'], ['song8', 'Author 8' , 'https://www.youtube.com/watch?v=LMuDrj5BpM0']],
+    'Fear': [['Scared to start', 'Michael Marcagi', 'https://www.youtube.com/watch?v=i1l7QLE4ju0'], ['song10', 'Author 10' , 'https://www.youtube.com/watch?v=i1l7QLE4ju0']]
+}
+
 # NUM_CLASSES = 5
 # tf_model = (TFAutoModelForSequenceClassification.from_pretrained(model_ckpt, num_labels=NUM_CLASSES))
 # set tokenizer
@@ -18,6 +26,7 @@ def tokenize(batch):
     input_ids = encoded_dict["input_ids"]
     attention_mask = encoded_dict["attention_mask"]
     return input_ids, attention_mask
+
 def extract_hidden_states(batch):
     # First convert text to tokens
     inputs = tokenizer(batch["text"], padding="max_length",
@@ -52,6 +61,13 @@ def detect_sentiment(sentence):
     max_label = max(filtered_sentiments, key=lambda x: x['score'])['label']
     return (max_label)
 
+def Song_reco(caption,dict):
+# Extract items with "emotion" as the key
+  emotion_items = [value for key, value in dict.items() if str(detect_sentiment_custom(caption)) in key]
+  emotion_items = emotion_items[0]
+# Print the extracted items
+  return (emotion_items)
+
 st.set_page_config(page_title = "My Webpage", page_icon=":tada:", layout="wide")
 
 # --- HEADER SECTION---
@@ -75,15 +91,15 @@ with col1:
 with col2:
     with st.container():
         if caption:
-            st.subheader(string_concat(caption))
+            st.subheader(Song_reco(caption,my_dict)[0][0])
 
-            st.write("By Artist name :microphone:")
-            audio_file = open('7400.mp3', 'rb')
-            audio_bytes = audio_file.read()
-            st.audio(audio_bytes, format='audio/ogg')
+            st.write("By " +  Song_reco(caption,my_dict)[0][1] + ":microphone:")
+            #audio_file = open('7400.mp3', 'rb')
+            #audio_bytes = audio_file.read()
+            #st.audio(audio_bytes, format='audio/ogg')
 
             with st.popover("Watch music video here"):
-                VIDEO_URL = "https://www.youtube.com/watch?v=wd7JqXouRRA"
+                VIDEO_URL = Song_reco(caption,my_dict)[0][2]
                 st.video(VIDEO_URL)
         else:
             st.subheader("You will see your recommended songs here :point_down:")
@@ -92,13 +108,13 @@ with col2:
 
     with st.container():
         if caption:
-            st.subheader(string_concat(caption))
+            st.subheader(Song_reco(caption,my_dict)[1][0])
 
-            st.write("By Artist name :microphone:")
-            audio_file = open('7400.mp3', 'rb')
-            audio_bytes = audio_file.read()
-            st.audio(audio_bytes, format='audio/ogg')
+            st.write("By " +  Song_reco(caption,my_dict)[1][1] + ":microphone:")
+            #audio_file = open('7400.mp3', 'rb')
+            #audio_bytes = audio_file.read()
+            #st.audio(audio_bytes, format='audio/ogg')
 
             with st.popover("Watch music video here"):
-                VIDEO_URL = "https://www.youtube.com/watch?v=wd7JqXouRRA"
+                VIDEO_URL = Song_reco(caption,my_dict)[1][2]
                 st.video(VIDEO_URL)
